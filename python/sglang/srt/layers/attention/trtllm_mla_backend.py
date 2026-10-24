@@ -547,10 +547,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         device: torch.device,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
-        if forward_mode.is_target_verify() and bs in self.decode_cuda_graph_metadata:
-            # Token tiers at the same slot count must share one per-bs buffer
-            # set (each graph bakes in the tensors it captured).
-            self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
+        key = (
+            bs,
+            ForwardMode.DECODE if forward_mode.is_decode_or_idle() else forward_mode,
+        )
+        metadata = self.decode_cuda_graph_metadata.get(key)
+        if metadata is not None:
+            # Variants and token tiers share the buffers replay refreshes;
+            # different modes have different query/sequence-length layouts.
+            self.forward_decode_metadata = metadata
             return
         metadata = TRTLLMMLADecodeMetadata()
 
@@ -598,7 +603,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
             )
 
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[key] = metadata
         self.forward_decode_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -614,7 +619,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
         the non-decode-family modes to the FlashInferMLA parent).
         """
-        metadata = self.decode_cuda_graph_metadata[bs]
+        key = (
+            bs,
+            ForwardMode.DECODE if forward_mode.is_decode_or_idle() else forward_mode,
+        )
+        metadata = self.decode_cuda_graph_metadata[key]
 
         if get_parallel().dcp_enabled:
             return self._apply_dcp_cuda_graph_metadata(
