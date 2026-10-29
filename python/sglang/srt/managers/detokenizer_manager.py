@@ -350,7 +350,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             elif (s := self.decode_status.get(rid)) is None:
                 logger.warning(
                     f"Dropped the text of an output for {rid=}, which has no decode "
-                    "status. It may have been evicted: the detokenizer keeps at most "
+                    "status: it was evicted, or already released when the request "
+                    "ended outside the output stream. The detokenizer keeps at most "
                     f"SGLANG_DETOKENIZER_MAX_STATES={DETOKENIZER_MAX_STATES} states. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
