@@ -174,11 +174,11 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         self.assertEqual(out.output_strs, ["", "6."])
         self.assertEqual(out.http_worker_ipcs, [None, "worker-a"])
 
-    def test_a_row_that_does_not_continue_the_received_ids_is_dropped(self):
+    def test_a_row_that_does_not_continue_the_received_ids_raises_an_alarm(self):
         """Each row's completion_tokens is the ids received before plus its own.
-        A row that breaks it gets no text (and raises in CI); a header restarts
-        the count, so a late row of the request a reused rid replaced fails; a
-        beam row, whose completion_tokens counts its sequences, is not checked."""
+        A row that breaks it logs a warning (raises in CI) but is still decoded,
+        and the count resyncs to it; a header restarts the count; a beam row,
+        whose completion_tokens counts its sequences, is not checked."""
         detok = _detokenizer()
         sent = {}
         detok.handle_batch_token_id_out(
@@ -188,21 +188,30 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
             _output(sent, [("r", [4], _header([2]), False)])
         )
 
-        late = _output({"r": 5}, [("r", [5], None, False)])
+        skipped = _output({"r": 5}, [("r", [5], None, False)])
+        with envs.SGLANG_IS_IN_CI.override(True), self.assertRaises(RuntimeError):
+            detok.handle_batch_token_id_out(skipped)
         with self.assertLogs(
             "sglang.srt.managers.detokenizer_manager", level="WARNING"
         ) as logs:
-            out = detok.handle_batch_token_id_out(late)
+            out = detok.handle_batch_token_id_out(skipped)
         self.assertIn("do not continue the 1 received", logs.output[0])
-        self.assertEqual(out.output_strs, [""])
-        with envs.SGLANG_IS_IN_CI.override(True), self.assertRaises(RuntimeError):
-            detok.handle_batch_token_id_out(late)
+        self.assertEqual(out.output_strs, ["5."])
+        self.assertEqual(out.http_worker_ipcs, ["worker-a"])
 
-        beam = _output(sent, [("r", [6], None, True)])
+        with self.assertNoLogs(
+            "sglang.srt.managers.detokenizer_manager", level="WARNING"
+        ):
+            out = detok.handle_batch_token_id_out(
+                _output({"r": 6}, [("r", [7], None, False)])
+            )
+        self.assertEqual(out.output_strs, ["7."])
+
+        beam = _output(sent, [("r", [8], None, True)])
         beam.completion_tokens = [9]
         beam.beam_search_output = [BeamSearchOutput(sequences=[])]
         out = detok.handle_batch_token_id_out(beam)
-        self.assertEqual(out.output_strs, ["6."])
+        self.assertEqual(out.output_strs, ["8."])
 
 
 if __name__ == "__main__":

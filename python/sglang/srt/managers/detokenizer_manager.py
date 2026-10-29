@@ -326,8 +326,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self, recv_obj: BatchTokenIDOutput
     ) -> List[Optional[DecodeStatus]]:
         """By row, the request's DecodeStatus with the row's output ids appended;
-        None for a row whose request has no state or whose ids do not continue
-        the ones received."""
+        None for a row whose request has no state."""
         vocab_size = self.vocab_size
         headers = recv_obj.detokenize_headers
         beam_outputs = recv_obj.beam_search_output
@@ -355,24 +354,23 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     f"SGLANG_DETOKENIZER_MAX_STATES={DETOKENIZER_MAX_STATES} states. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
-            if (
-                s is not None
-                # A beam row's completion_tokens counts its returned sequences.
-                and (beam_outputs is None or beam_outputs[i] is None)
-                and s.num_output_ids + len(output_ids) != recv_obj.completion_tokens[i]
-            ):
-                msg = (
-                    f"Output ids of {rid=} do not continue the {s.num_output_ids} "
-                    f"received: {len(output_ids)} new for "
-                    f"{recv_obj.completion_tokens[i]} in all; its row gets no text "
-                    "and no http_worker_ipc."
-                )
-                if envs.SGLANG_IS_IN_CI.get():
-                    raise RuntimeError(msg)
-                logger.warning(msg)
-                s = None
             if s is not None:
-                s.num_output_ids += len(output_ids)
+                num_output_ids = s.num_output_ids + len(output_ids)
+                # A beam row's completion_tokens counts its returned sequences.
+                if (beam_outputs is None or beam_outputs[i] is None) and (
+                    num_output_ids != recv_obj.completion_tokens[i]
+                ):
+                    # An alarm only: the row is still decoded and routed.
+                    msg = (
+                        f"Output ids of {rid=} do not continue the "
+                        f"{s.num_output_ids} received: {len(output_ids)} new for "
+                        f"{recv_obj.completion_tokens[i]} in all."
+                    )
+                    if envs.SGLANG_IS_IN_CI.get():
+                        raise RuntimeError(msg)
+                    logger.warning(msg)
+                    num_output_ids = recv_obj.completion_tokens[i]
+                s.num_output_ids = num_output_ids
                 s.decode_ids.extend(self._clamp_decode_ids(output_ids, vocab_size))
             states.append(s)
         return states
