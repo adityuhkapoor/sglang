@@ -490,7 +490,8 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket."""
+        goes to the tokenizer socket, and the detokenizer's state of the
+        request, which no finished row will free, is released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -514,12 +515,14 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
         )
+        scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses

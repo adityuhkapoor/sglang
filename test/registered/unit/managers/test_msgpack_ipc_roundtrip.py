@@ -10,6 +10,7 @@ type-specific decisions (the `ExpertWeightPointer` narrowing, the
 
 import dataclasses
 import unittest
+from array import array
 
 import msgspec
 
@@ -22,6 +23,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ChecksumInfo,
     CheckWeightsReqOutput,
+    DetokenizeHeader,
+    DetokenizeReleaseReq,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertWeightPointer,
@@ -331,6 +334,37 @@ class TestRequestStatsRoundTrip(CustomTestCase):
                 self.assertIsInstance(
                     decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
                 )
+
+
+class TestDetokenizeRoundTrip(CustomTestCase):
+    """The detokenizer's per-request header and release request decode back to
+    typed structs, the header's prompt tail to an array."""
+
+    def test_header_and_release_round_trip(self):
+        header = DetokenizeHeader(
+            prompt_tail_ids=array("q", [151644, 872, 198]),
+            skip_special_tokens=False,
+            spaces_between_special_tokens=True,
+            no_stop_trim=True,
+            http_worker_ipc="ipc:///tmp/tokenizer-0",
+        )
+        required = {
+            f.name: [] for f in msgspec.structs.fields(BatchTokenIDOutput) if f.required
+        }
+        obj = BatchTokenIDOutput(**{**required, "rids": ["a", "b"]})
+        obj.detokenize_headers = [header, None]
+        obj.finished_http_worker_ipcs = [None, "ipc:///tmp/tokenizer-1"]
+
+        decoded = _double_hop(obj)
+
+        self.assertEqual(decoded.detokenize_headers, [header, None])
+        self.assertIsInstance(decoded.detokenize_headers[0], DetokenizeHeader)
+        self.assertIsInstance(decoded.detokenize_headers[0].prompt_tail_ids, array)
+        self.assertEqual(
+            decoded.finished_http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"]
+        )
+        release = DetokenizeReleaseReq(rid="a")
+        self.assertEqual(_double_hop(release), release)
 
 
 if __name__ == "__main__":

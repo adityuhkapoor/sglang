@@ -322,6 +322,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             results[i] = text
         return results
 
+    @staticmethod
+    def _check_continuity(
+        *, rid: str, num_received: int, num_new: int, completion_tokens: int
+    ) -> None:
+        if num_received + num_new != completion_tokens:
+            # An alarm only: the row is still decoded and routed.
+            msg = (
+                f"Output ids of {rid=} do not continue the "
+                f"{num_received} received: {num_new} new for "
+                f"{completion_tokens} in all."
+            )
+            if envs.SGLANG_IS_IN_CI.get():
+                raise RuntimeError(msg)
+            logger.warning(msg)
+
     def _update_decode_status(
         self, recv_obj: BatchTokenIDOutput
     ) -> List[Optional[DecodeStatus]]:
@@ -356,22 +371,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
             if s is not None:
-                num_output_ids = s.num_output_ids + len(output_ids)
-                # A beam row's completion_tokens counts its returned sequences.
-                if (beam_outputs is None or beam_outputs[i] is None) and (
-                    num_output_ids != recv_obj.completion_tokens[i]
-                ):
-                    # An alarm only: the row is still decoded and routed.
-                    msg = (
-                        f"Output ids of {rid=} do not continue the "
-                        f"{s.num_output_ids} received: {len(output_ids)} new for "
-                        f"{recv_obj.completion_tokens[i]} in all."
+                if beam_outputs is None or beam_outputs[i] is None:
+                    self._check_continuity(
+                        rid=rid,
+                        num_received=s.num_output_ids,
+                        num_new=len(output_ids),
+                        completion_tokens=recv_obj.completion_tokens[i],
                     )
-                    if envs.SGLANG_IS_IN_CI.get():
-                        raise RuntimeError(msg)
-                    logger.warning(msg)
-                    num_output_ids = recv_obj.completion_tokens[i]
-                s.num_output_ids = num_output_ids
+                    # Equal to the received count plus the row's, unless the alarm
+                    # fired; then resync to the scheduler's count.
+                    s.num_output_ids = recv_obj.completion_tokens[i]
+                else:
+                    # A beam row's completion_tokens counts its returned sequences.
+                    s.num_output_ids += len(output_ids)
                 s.decode_ids.extend(self._clamp_decode_ids(output_ids, vocab_size))
             states.append(s)
         return states
