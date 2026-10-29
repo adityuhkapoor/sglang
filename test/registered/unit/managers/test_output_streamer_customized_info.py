@@ -18,7 +18,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
-    RequestOutputHeader,
+    RequestOutputStats,
     msgpack_decode,
     msgpack_encode,
     unwrap_from_pickle,
@@ -43,6 +43,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 
 class _FakeReq:
@@ -84,7 +95,7 @@ class _FakeReq:
         self.cached_tokens_host = 0
         self.cached_tokens_storage = 0
         self.retraction_count = 0
-        self.request_header_retraction_count = None
+        self.request_stats_retraction_count = None
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -101,10 +112,11 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    take_request_stats_due = Req.take_request_stats_due
+    take_detokenize_header_due = Req.take_detokenize_header_due
+
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
-
-    take_detokenize_header_due = Req.take_detokenize_header_due
 
     def check_match_stop_str_prefix(self):
         return False
@@ -126,7 +138,7 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        build_request_header=lambda req: None,
+        build_request_stats=lambda req: _REQUEST_STATS,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
@@ -614,7 +626,7 @@ def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True)
     )
 
 
-class TestOutputStreamerRequestHeader(unittest.TestCase):
+class TestOutputStreamerRequestStats(unittest.TestCase):
     def setUp(self):
         _enter_streamer_scope(self)
 
@@ -628,9 +640,7 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
         observability.start()
         self.addCleanup(observability.stop)
 
-    def test_header_carries_time_stats_only_with_metrics_on(self):
-        """With metrics on a request's header carries its time stats, None for
-        a request whose own metrics are off; with metrics off it carries none."""
+    def test_request_stats_carry_time_stats_only_with_metrics_on(self):
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
@@ -638,14 +648,14 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
             self._set_metrics(enable_metrics)
             req = _FakeReq("r", [1])
             req.time_stats = req_time_stats
-            return _streamer([]).build_request_header(req).time_stats
+            return _streamer([]).build_request_stats(req).time_stats
 
         self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
         self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
         self.assertIsNone(time_stats(False, timed))
 
-    def test_header_goes_out_on_first_output_retraction_and_finish(self):
-        """A request's header goes out with its first output, with the first
+    def test_request_stats_go_out_on_first_output_retraction_and_finish(self):
+        """A request's stats go out with its first output, with the first
         output after each retraction, and with its finished row; other rows
         carry none, so they keep the values last sent."""
         self._set_metrics(True)
@@ -659,7 +669,7 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
             if finished:
                 req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
             streamer.stream_output([req], False)
-            return outputs[-1].request_headers
+            return outputs[-1].request_stats
 
         [first] = output()
         self.assertEqual(
@@ -681,9 +691,9 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
         self.assertEqual(finished.retraction_count, 1)
         self.assertEqual(finished.time_stats.queue_time, 0.5)
 
-    def test_embedding_rows_carry_their_header(self):
+    def test_embedding_rows_carry_their_request_stats(self):
         """An embedding request is output once, finished, and its row carries
-        its header; embedding outputs carry no time stats even with metrics on."""
+        its stats; embedding outputs carry no time stats even with metrics on."""
         self._set_metrics(True)
         outputs = []
         streamer = _streamer(outputs, is_generation=False)
@@ -695,16 +705,16 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
 
         streamer.stream_output([req], False)
 
-        [header] = outputs[-1].request_headers
-        self.assertIsInstance(header, RequestOutputHeader)
+        [stats] = outputs[-1].request_stats
+        self.assertIsInstance(stats, RequestOutputStats)
         self.assertEqual(
-            (header.prompt_tokens, header.cached_tokens, header.retraction_count),
+            (stats.prompt_tokens, stats.cached_tokens, stats.retraction_count),
             (3, 2, 1),
         )
-        self.assertIsNone(header.time_stats)
+        self.assertIsNone(stats.time_stats)
 
-    def test_finished_output_carries_current_header(self):
-        """A finished output carries the request's current header even when a
+    def test_finished_output_carries_current_request_stats(self):
+        """A finished output carries the request's current stats even when a
         value changed after the last one was sent: HiCache storage attached
         mid-request adds the storage keys to cached_tokens_details."""
         attached = False
@@ -715,18 +725,18 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
 
         req.output_ids.append(7)
         streamer.stream_output([req], False)
-        [first] = outputs[-1].request_headers
+        [first] = outputs[-1].request_stats
         self.assertEqual(first.cached_tokens_details, {"device": 2, "host": 0})
 
         attached = True
         req.output_ids.append(8)
         streamer.stream_output([req], False)
-        self.assertIsNone(outputs[-1].request_headers)
+        self.assertIsNone(outputs[-1].request_stats)
 
         req.output_ids.append(9)
         req.finished_reason = FINISH_LENGTH(length=3)
         streamer.stream_output([req], False)
-        [finished] = outputs[-1].request_headers
+        [finished] = outputs[-1].request_stats
         self.assertEqual(
             finished.cached_tokens_details,
             {"device": 2, "host": 0, "storage": 0, "storage_backend": "none"},

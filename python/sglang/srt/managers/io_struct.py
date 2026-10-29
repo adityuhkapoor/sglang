@@ -1580,12 +1580,12 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
-class RequestOutputHeader(
+class RequestOutputStats(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """A request's per-request output values, as opposed to per-step ones.
-    The scheduler sends it on a request's first output, its first output after
-    each retraction and its finished row; the tokenizer keeps the latest."""
+    """A request's output values that change only at a few points. Sent on its
+    first output, its first after each retraction, and its finished row; a value
+    that changes at any other time shows only on the finished output."""
 
     prompt_tokens: int
     cached_tokens: int
@@ -1722,10 +1722,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # By row, the request's header on the rows that send it (see
-    # RequestOutputHeader), else None; the whole field is None when no row
-    # carries one.
-    request_headers: Optional[List[Optional[RequestOutputHeader]]] = None
+    # Per row: the request's stats when due (see RequestOutputStats), else
+    # None; None when no row carries any.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
     # Rust server mode only: per-step header columns of
     # `RustServer.push_generation`; None otherwise.
@@ -1818,8 +1817,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # See BatchTokenIDOutput.request_headers.
-    request_headers: Optional[List[Optional[RequestOutputHeader]]] = None
+    # See BatchTokenIDOutput.request_stats.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
@@ -1843,8 +1842,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
-    # Each request is output once, so every row carries its header.
-    request_headers: List[RequestOutputHeader]
+    # Each request is output once, so every row carries its stats.
+    request_stats: List[RequestOutputStats]
     # Placeholder token info
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]

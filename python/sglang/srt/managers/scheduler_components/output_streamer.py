@@ -27,7 +27,7 @@ from sglang.srt.managers.io_struct import (
     CachedTokensDetails,
     DetokenizeHeader,
     DetokenizeReleaseReq,
-    RequestOutputHeader,
+    RequestOutputStats,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -156,9 +156,9 @@ class SchedulerOutputStreamer:
 
         return None
 
-    def build_request_header(self, req: Req) -> RequestOutputHeader:
+    def build_request_stats(self, req: Req) -> RequestOutputStats:
         image_tokens, audio_tokens, video_tokens = req.get_mm_token_counts()
-        return RequestOutputHeader(
+        return RequestOutputStats(
             prompt_tokens=len(req.origin_input_ids),
             cached_tokens=req.cached_tokens,
             cached_tokens_details=self.get_cached_tokens_details(req),
@@ -238,7 +238,7 @@ class SchedulerOutputStreamer:
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
-            build_request_header=self.build_request_header,
+            build_request_stats=self.build_request_stats,
             is_request_level_customized_info_key=(
                 self.is_request_level_customized_info_key
             ),
@@ -318,7 +318,7 @@ class SchedulerOutputStreamer:
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
-        request_headers = []
+        request_stats = []
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -327,7 +327,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
-                request_headers.append(self.build_request_header(req))
+                request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
                 phs_list.append(phs)
@@ -363,7 +363,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs=http_worker_ipcs,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
-                request_headers=request_headers,
+                request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 pooled_hidden_states=stacked_phs,
@@ -382,7 +382,7 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    build_request_header: Callable[[Req], RequestOutputHeader]
+    build_request_stats: Callable[[Req], RequestOutputStats]
     is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
@@ -395,8 +395,8 @@ class _GenerationStreamAccumulator:
     has_detokenize_header: bool = False
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
-    request_headers: list = field(default_factory=list)
-    has_request_header: bool = False
+    request_stats: list = field(default_factory=list)
+    has_request_stats: bool = False
     # Rust server mode only; see BatchTokenIDOutput.prompt_tokens.
     prompt_tokens: Optional[list] = None
     cached_tokens: Optional[list] = None
@@ -541,10 +541,6 @@ class _GenerationStreamAccumulator:
             # Per-step header columns of `push_generation`.
             self.prompt_tokens.append(len(req.origin_input_ids))
             self.cached_tokens.append(req.cached_tokens)
-            # Multimodal prompt token counts. In disagg decode mode the prefill node
-            # already computed these and transferred them via the metadata buffer
-            # (req.mm_*), so prefer the pre-stored values; otherwise compute them
-            # from the request's multimodal items.
             image_t, audio_t, video_t = req.get_mm_token_counts()
             self.image_tokens.append(image_t)
             self.audio_tokens.append(audio_t)
@@ -569,18 +565,11 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
 
-            # The tokenizer keeps each request's latest header. It goes out with the
-            # first output, the first output after each retraction, and the
-            # finished row, so the final output reports the final values.
-            if (
-                req.request_header_retraction_count != req.retraction_count
-                or req.finished()
-            ):
-                self.request_headers.append(self.build_request_header(req))
-                self.has_request_header = True
-                req.request_header_retraction_count = req.retraction_count
+            if req.take_request_stats_due():
+                self.request_stats.append(self.build_request_stats(req))
+                self.has_request_stats = True
             else:
-                self.request_headers.append(None)
+                self.request_stats.append(None)
 
         if req.finished():
             self.weight_versions.append(
@@ -779,7 +768,7 @@ class _GenerationStreamAccumulator:
             ),
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
-            request_headers=self.request_headers if self.has_request_header else None,
+            request_stats=self.request_stats if self.has_request_stats else None,
             prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
             image_tokens=self.image_tokens,
