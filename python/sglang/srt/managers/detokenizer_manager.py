@@ -335,7 +335,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_ids = recv_obj.output_ids[i]
             header = None if headers is None else headers[i]
             if header is not None:
-                # A request's first output; a stale state of a reused rid goes.
+                # A request's first output; it replaces any stale state of a reused rid.
                 self.decode_status.pop(rid, None)
                 s = DecodeStatus(
                     decoded_text="",
@@ -376,6 +376,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             states.append(s)
         return states
 
+    # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def _decode_batch_token_id_output(
         self, recv_obj: BatchTokenIDOutput, states: List[Optional[DecodeStatus]]
     ):

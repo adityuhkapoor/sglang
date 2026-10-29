@@ -84,8 +84,7 @@ def decode_beam_search_output(
     disable_batch_decode: bool,
     trim_matched_stop: Callable,
 ) -> None:
-    """Fill each candidate sequence's `text` in place, with the decode flags of
-    the row's header; a row whose header the detokenizer lacks keeps no text."""
+    """Fill each candidate sequence's text in place with its row's header flags; rows without a header are skipped."""
     if disable_batch_decode:
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             header = headers[i]

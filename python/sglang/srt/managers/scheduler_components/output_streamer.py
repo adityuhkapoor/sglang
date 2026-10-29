@@ -53,7 +53,6 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
-# Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
 def _build_detokenize_header(req: Req) -> DetokenizeHeader:
     prompt_ids = req.origin_input_ids_unpadded
     surr_offset = max(len(prompt_ids) - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)

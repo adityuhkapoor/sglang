@@ -1666,7 +1666,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # The new output ids of each row, which the detokenizer decodes
+    # Each row's new output ids.
     output_ids: Optional[List[array]]  # Optional[List[array[int]]]
     # By row, the request's DetokenizeHeader on its first output, else None;
     # the whole field is None when no row carries one.
