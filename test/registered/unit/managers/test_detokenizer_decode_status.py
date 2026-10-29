@@ -191,27 +191,27 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         skipped = _output({"r": 5}, [("r", [5], None, False)])
         with envs.SGLANG_IS_IN_CI.override(True), self.assertRaises(RuntimeError):
             detok.handle_batch_token_id_out(skipped)
-        with self.assertLogs(
-            "sglang.srt.managers.detokenizer_manager", level="WARNING"
-        ) as logs:
-            out = detok.handle_batch_token_id_out(skipped)
-        self.assertIn("do not continue the 1 received", logs.output[0])
-        self.assertEqual(out.output_strs, ["5."])
-        self.assertEqual(out.http_worker_ipcs, ["worker-a"])
+        with envs.SGLANG_IS_IN_CI.override(False):
+            with self.assertLogs(
+                "sglang.srt.managers.detokenizer_manager", level="WARNING"
+            ) as logs:
+                out = detok.handle_batch_token_id_out(skipped)
+            self.assertIn("do not continue the 1 received", logs.output[0])
+            self.assertEqual(out.output_strs, ["5."])
+            self.assertEqual(out.http_worker_ipcs, ["worker-a"])
 
-        with self.assertNoLogs(
-            "sglang.srt.managers.detokenizer_manager", level="WARNING"
-        ):
-            out = detok.handle_batch_token_id_out(
-                _output({"r": 6}, [("r", [7], None, False)])
-            )
-        self.assertEqual(out.output_strs, ["7."])
-
-        beam = _output(sent, [("r", [8], None, True)])
-        beam.completion_tokens = [9]
-        beam.beam_search_output = [BeamSearchOutput(sequences=[])]
-        out = detok.handle_batch_token_id_out(beam)
-        self.assertEqual(out.output_strs, ["8."])
+            beam = _output(sent, [("r", [8], None, True)])
+            beam.completion_tokens = [9]
+            beam.beam_search_output = [BeamSearchOutput(sequences=[])]
+            with self.assertNoLogs(
+                "sglang.srt.managers.detokenizer_manager", level="WARNING"
+            ):
+                out = detok.handle_batch_token_id_out(
+                    _output({"r": 6}, [("r", [7], None, False)])
+                )
+                self.assertEqual(out.output_strs, ["7."])
+                out = detok.handle_batch_token_id_out(beam)
+            self.assertEqual(out.output_strs, ["8."])
 
 
 if __name__ == "__main__":
