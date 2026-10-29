@@ -829,10 +829,6 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            # The snapshot taken at construction, not a second bag read: this
-            # scheduler gates its tokenizer init on the same value, and the two
-            # must not be able to disagree.
-            skip_tokenizer_init=self.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
                 get_parallel().attn_tp_rank == 0

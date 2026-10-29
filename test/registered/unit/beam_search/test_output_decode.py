@@ -17,7 +17,7 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
-from sglang.srt.managers.io_struct import DetokenizeHeader
+from sglang.srt.managers.io_struct import DecodeInputs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,13 +35,12 @@ def _trim(output, finished_reason, no_stop_trim):
     )
 
 
-def _header(*, no_stop_trim):
-    return DetokenizeHeader(
+def _inputs(*, no_stop_trim):
+    return DecodeInputs(
         prompt_tail_ids=array("q"),
         skip_special_tokens=True,
         spaces_between_special_tokens=True,
         no_stop_trim=no_stop_trim,
-        http_worker_ipc=None,
     )
 
 
@@ -107,7 +106,7 @@ def _decode(group, *, disable_batch_decode):
     )
     decode_beam_search_output(
         recv_obj,
-        [_header(no_stop_trim=False)],
+        [_inputs(no_stop_trim=False)],
         tokenizer=_IdTokenizer(),
         disable_batch_decode=disable_batch_decode,
         trim_matched_stop=_trim,
@@ -155,7 +154,7 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         )
         decode_beam_search_output(
             recv_obj,
-            [_header(no_stop_trim=True)],
+            [_inputs(no_stop_trim=True)],
             tokenizer=_IdTokenizer(),
             disable_batch_decode=True,
             trim_matched_stop=_trim,
@@ -172,7 +171,7 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         )
         decode_beam_search_output(
             recv_obj,
-            [_header(no_stop_trim=False), _header(no_stop_trim=False)],
+            [_inputs(no_stop_trim=False), _inputs(no_stop_trim=False)],
             tokenizer=_IdTokenizer(),
             disable_batch_decode=False,
             trim_matched_stop=_trim,

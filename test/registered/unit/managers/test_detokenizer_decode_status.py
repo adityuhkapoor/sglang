@@ -3,18 +3,22 @@ on its first output and decodes every later row from that row's output_ids."""
 
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import (
     DetokenizerManager,
     LimitedCapacityDict,
 )
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
+    DecodeInputs,
     DetokenizeHeader,
     DetokenizeReleaseReq,
 )
@@ -40,13 +44,20 @@ class _Tokenizer:
         return [self.decode(ids, **kwargs) for ids in ids_list]
 
 
-def _header(prompt_tail_ids, *, skip_special_tokens=True, ipc="worker-a"):
+def _header(prompt_tail_ids=None, *, skip_special_tokens=True, ipc="worker-a"):
+    """prompt_tail_ids None: a --skip-tokenizer-init header, with no decode inputs."""
     return DetokenizeHeader(
-        prompt_tail_ids=array("q", prompt_tail_ids),
-        skip_special_tokens=skip_special_tokens,
-        spaces_between_special_tokens=True,
-        no_stop_trim=False,
         http_worker_ipc=ipc,
+        decode_inputs=(
+            None
+            if prompt_tail_ids is None
+            else DecodeInputs(
+                prompt_tail_ids=array("q", prompt_tail_ids),
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=True,
+                no_stop_trim=False,
+            )
+        ),
     )
 
 
@@ -85,9 +96,9 @@ def _output(rows):
     )
 
 
-def _detokenizer():
+def _detokenizer(tokenizer=_Tokenizer()):
     detok = DetokenizerManager.__new__(DetokenizerManager)
-    detok.tokenizer = _Tokenizer()
+    detok.tokenizer = tokenizer
     detok.vocab_size = None
     detok.decode_status = LimitedCapacityDict(capacity=16)
     detok.disable_tokenizer_batch_decode = False
@@ -156,6 +167,58 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         self.assertIn("rid='gone'", logs.output[0])
         self.assertEqual(out.output_strs, ["", "6."])
         self.assertEqual(out.http_worker_ipcs, [None, "worker-a"])
+
+    def test_skip_tokenizer_init_routes_rows_to_their_tokenizer_worker(self):
+        """With --skip-tokenizer-init the detokenizer decodes nothing but still
+        routes: rows carry no http_worker_ipcs, and each goes to the worker its
+        request's first row named, until the request finishes or is released."""
+        detok = _detokenizer(tokenizer=None)
+        detok.init_request_dispatcher()
+        detok.recv_from_scheduler = None
+        detok.soft_watchdog = MagicMock()
+        inbox = [
+            _output(
+                [
+                    ("a", [1], _header(ipc="w0"), False),
+                    ("b", [2], _header(ipc="w1"), False),
+                ]
+            ),
+            _output([("b", [3], None, True), ("a", [4], None, False)]),
+            DetokenizeReleaseReq(rid="a"),
+            _output([("a", [5], None, False)]),
+        ]
+        received = []
+        mapping = SimpleNamespace(
+            send_output=lambda ipc, obj, is_tokenizer: received.append(
+                (ipc, obj.rids, [list(ids) for ids in obj.output_ids])
+            )
+        )
+
+        def recv(_socket):
+            if not inbox:
+                raise EOFError
+            return inbox.pop(0)
+
+        with (
+            patch.object(multi_tokenizer_mixin, "SocketMapping", return_value=mapping),
+            patch.object(multi_tokenizer_mixin, "sock_recv", side_effect=recv),
+            self.assertLogs("sglang.srt.managers.detokenizer_manager", level="WARNING"),
+            self.assertRaises(EOFError),
+        ):
+            detok.multi_http_worker_event_loop()
+
+        self.assertEqual(
+            received,
+            [
+                ("w0", ["a"], [[1]]),
+                ("w1", ["b"], [[2]]),
+                ("w1", ["b"], [[3]]),
+                ("w0", ["a"], [[4]]),
+                # The released request has no route left.
+                (None, ["a"], [[5]]),
+            ],
+        )
+        self.assertEqual(len(detok.decode_status), 0)
 
 
 if __name__ == "__main__":

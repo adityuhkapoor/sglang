@@ -1643,12 +1643,11 @@ def build_flat_top_logprobs_arrays(
     return val_arr, idx_arr, null_prefix
 
 
-class DetokenizeHeader(
+class DecodeInputs(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """A request's detokenization inputs. The scheduler sends it on the request's
-    first output only; the detokenizer keeps it for the request's lifetime and
-    decodes every later row from that row's output_ids."""
+    """What the detokenizer needs, besides each row's output_ids, to decode a
+    request's text."""
 
     # The prompt tail decoded ahead of the output as context; the output text
     # starts after it.
@@ -1656,12 +1655,23 @@ class DetokenizeHeader(
     skip_special_tokens: bool
     spaces_between_special_tokens: bool
     no_stop_trim: bool
+
+
+class DetokenizeHeader(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """A request's detokenizer inputs. The scheduler sends it on the request's
+    first output only; the detokenizer keeps it until the finished row or a
+    DetokenizeReleaseReq, and routes and decodes every later row with it."""
+
     http_worker_ipc: Optional[str]
+    # None with --skip-tokenizer-init, where the detokenizer only routes.
+    decode_inputs: Optional[DecodeInputs]
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
-    # http_worker_ipcs is set only with --skip-tokenizer-init, where no
-    # detokenizer keeps it; otherwise the DetokenizeHeader carries it.
+    # The scheduler leaves http_worker_ipcs None; the detokenizer fills it from
+    # each request's DetokenizeHeader.
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1696,8 +1706,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
-    # straight to TokenizerManager, which encodes on demand.
+    # BatchStrOutput; on the skip_tokenizer_init path it forwards this as is
+    # to TokenizerManager, which encodes on demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]

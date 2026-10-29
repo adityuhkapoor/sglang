@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    DecodeInputs,
     DetokenizeHeader,
     DetokenizeReleaseReq,
     RequestOutputHeader,
@@ -54,16 +55,15 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-def _build_detokenize_header(req: Req) -> DetokenizeHeader:
+def _build_decode_inputs(req: Req) -> DecodeInputs:
     prompt_ids = req.origin_input_ids_unpadded
     surr_offset = max(len(prompt_ids) - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
     sampling_params = req.sampling_params
-    return DetokenizeHeader(
+    return DecodeInputs(
         prompt_tail_ids=prompt_ids[surr_offset:],
         skip_special_tokens=sampling_params.skip_special_tokens,
         spaces_between_special_tokens=sampling_params.spaces_between_special_tokens,
         no_stop_trim=sampling_params.no_stop_trim,
-        http_worker_ipc=req.http_worker_ipc,
     )
 
 
@@ -91,7 +91,7 @@ class SchedulerOutputStreamer:
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
-    # Outputs go straight to the tokenizer side, with no detokenizer between.
+    # The detokenizer routes outputs but does not decode them.
     skip_tokenizer_init: bool
     enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
@@ -174,6 +174,14 @@ class SchedulerOutputStreamer:
             ),
         )
 
+    def build_detokenize_header(self, req: Req) -> DetokenizeHeader:
+        return DetokenizeHeader(
+            http_worker_ipc=req.http_worker_ipc,
+            decode_inputs=None
+            if self.skip_tokenizer_init
+            else _build_decode_inputs(req),
+        )
+
     def release_detokenize_state(self, req: Req) -> None:
         """Free the detokenizer's state of a request that ends outside the output stream."""
         if req.detokenize_header_sent:
@@ -239,11 +247,11 @@ class SchedulerOutputStreamer:
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             build_request_header=self.build_request_header,
+            build_detokenize_header=self.build_detokenize_header,
             is_request_level_customized_info_key=(
                 self.is_request_level_customized_info_key
             ),
             rust_server_mode=self.rust_server is not None,
-            skip_tokenizer_init=self.skip_tokenizer_init,
             current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
@@ -383,12 +391,11 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     build_request_header: Callable[[Req], RequestOutputHeader]
+    build_detokenize_header: Callable[[Req], DetokenizeHeader]
     is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
-    # skip_tokenizer_init only; see BatchTokenIDOutput.
-    http_worker_ipcs: Optional[list] = None
     finished_reasons: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     detokenize_headers: list = field(default_factory=list)
@@ -436,7 +443,6 @@ class _GenerationStreamAccumulator:
     output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
     # The payload goes to `RustServer.push_generation`, not the detokenizer.
     rust_server_mode: bool = False
-    skip_tokenizer_init: bool
     # Rust server mode: by row, the decode latency of a finished non-streaming
     # request, whose first token the Rust frontend does not see.
     decode_latencies: dict = field(default_factory=dict)
@@ -448,8 +454,6 @@ class _GenerationStreamAccumulator:
             self.image_tokens = []
             self.audio_tokens = []
             self.video_tokens = []
-        elif self.skip_tokenizer_init:
-            self.http_worker_ipcs = []
         if self.return_hidden_states:
             self.output_hidden_states = []
         if self.return_routed_experts:
@@ -556,10 +560,8 @@ class _GenerationStreamAccumulator:
             # ChunkEvent, so `push_generation` never reads these — skip the whole
             # block. The parallel lists stay empty; the payload goes straight to
             # `push_generation`, which only indexes the fields appended outside it.
-            if self.skip_tokenizer_init:
-                self.http_worker_ipcs.append(req.http_worker_ipc)
-            elif req.take_detokenize_header_due():
-                self.detokenize_headers.append(_build_detokenize_header(req))
+            if req.take_detokenize_header_due():
+                self.detokenize_headers.append(self.build_detokenize_header(req))
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
@@ -765,7 +767,6 @@ class _GenerationStreamAccumulator:
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
-            http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,

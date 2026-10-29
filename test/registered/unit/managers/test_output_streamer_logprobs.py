@@ -1,5 +1,4 @@
 import unittest
-from array import array
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -34,7 +33,6 @@ class _FakeReq:
         self.send_output_token_logprobs_offset = 0
         self.detokenize_header_sent = False
         self.origin_input_ids = []
-        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
@@ -81,8 +79,8 @@ def _make_accumulator(
         default_stream_interval=1,
         default_force_stream_interval=1,
         build_request_header=lambda req: None,
+        build_detokenize_header=lambda req: None,
         rust_server_mode=rust_server_mode,
-        skip_tokenizer_init=False,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )

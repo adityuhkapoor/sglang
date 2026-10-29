@@ -127,10 +127,10 @@ def _accumulator(
         default_stream_interval=1,
         default_force_stream_interval=1,
         build_request_header=lambda req: None,
+        build_detokenize_header=lambda req: None,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
-        skip_tokenizer_init=False,
     )
 
 
@@ -920,31 +920,52 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         req.http_worker_ipc = "worker-a"
         return req
 
+    def _streamer(self, outputs, skip_tokenizer_init):
+        return SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            server_args=SimpleNamespace(enable_lmcache=False),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=skip_tokenizer_init,
+            enable_hicache_storage=lambda: False,
+        )
+
     def test_header_goes_out_on_first_output_only(self):
         """The detokenizer keeps the header for the request's lifetime, and
-        retraction keeps the output ids it decodes, so no later row resends it."""
-        outputs = []
-        streamer = _streamer(outputs)
-        req = self._req()
+        retraction keeps the output ids it decodes, so no later row resends it.
+        No row carries http_worker_ipcs: the detokenizer routes from the header,
+        which carries no decode inputs with --skip-tokenizer-init."""
+        for skip_tokenizer_init in (False, True):
+            with self.subTest(skip_tokenizer_init=skip_tokenizer_init):
+                outputs = []
+                streamer = self._streamer(outputs, skip_tokenizer_init)
+                req = self._req()
 
-        def output():
-            req.output_ids.append(7)
-            streamer.stream_output([req], False)
-            [payload] = outputs
-            outputs.clear()
-            return payload.detokenize_headers
+                def output():
+                    req.output_ids.append(7)
+                    streamer.stream_output([req], False)
+                    [payload] = outputs
+                    outputs.clear()
+                    self.assertIsNone(payload.http_worker_ipcs)
+                    return payload.detokenize_headers
 
-        [first] = output()
-        self.assertEqual(list(first.prompt_tail_ids), [2, 3, 4, 5, 6])
-        self.assertFalse(first.skip_special_tokens)
-        self.assertEqual(first.http_worker_ipc, "worker-a")
-        self.assertIsNone(output())
-        req.reset_for_retract()
-        self.assertIsNone(output())
+                [first] = output()
+                self.assertEqual(first.http_worker_ipc, "worker-a")
+                inputs = first.decode_inputs
+                if skip_tokenizer_init:
+                    self.assertIsNone(inputs)
+                else:
+                    self.assertEqual(list(inputs.prompt_tail_ids), [2, 3, 4, 5, 6])
+                    self.assertFalse(inputs.skip_special_tokens)
+                self.assertIsNone(output())
+                req.reset_for_retract()
+                self.assertIsNone(output())
 
     def test_release_follows_a_sent_header_only(self):
         outputs = []
-        streamer = _streamer(outputs)
+        streamer = self._streamer(outputs, skip_tokenizer_init=False)
         req = self._req()
 
         streamer.release_detokenize_state(req)
@@ -954,29 +975,6 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         streamer.stream_output([req], False)
         streamer.release_detokenize_state(req)
         self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
-
-    def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
-        """Without a detokenizer the tokenizer-side router routes each row by
-        its http_worker_ipc, and nothing would keep a header."""
-        outputs = []
-        streamer = SchedulerOutputStreamer(
-            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
-            tree_cache=None,
-            server_args=SimpleNamespace(enable_lmcache=False),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            skip_tokenizer_init=True,
-            enable_hicache_storage=lambda: False,
-        )
-        req = self._req()
-        for _ in range(2):
-            req.output_ids.append(7)
-            streamer.stream_output([req], False)
-            self.assertEqual(outputs[-1].http_worker_ipcs, ["worker-a"])
-            self.assertIsNone(outputs[-1].detokenize_headers)
-        streamer.release_detokenize_state(req)
-        self.assertEqual(len(outputs), 2)
 
 
 if __name__ == "__main__":

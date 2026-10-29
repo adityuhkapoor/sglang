@@ -322,36 +322,40 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _update_decode_status(
         self, recv_obj: BatchTokenIDOutput
     ) -> List[Optional[DecodeStatus]]:
-        """By row, the request's DecodeStatus with the row's output ids appended;
-        None for a row whose request has no state."""
+        """By row, the request's DecodeStatus with the row's output ids appended
+        when it decodes; None for a row whose request has no state."""
         vocab_size = self.vocab_size
         headers = recv_obj.detokenize_headers
         states = []
         for i, rid in enumerate(recv_obj.rids):
-            output_ids = self._clamp_decode_ids(recv_obj.output_ids[i], vocab_size)
             header = None if headers is None else headers[i]
             if header is not None:
                 # A request's first output; a stale state of a reused rid goes.
                 self.decode_status.pop(rid, None)
+                inputs = header.decode_inputs
                 s = DecodeStatus(
                     decoded_text="",
                     decode_ids=(
-                        self._clamp_decode_ids(header.prompt_tail_ids, vocab_size)
-                        + output_ids
+                        []
+                        if inputs is None
+                        else self._clamp_decode_ids(inputs.prompt_tail_ids, vocab_size)
                     ),
                     surr_offset=0,
-                    read_offset=len(header.prompt_tail_ids),
+                    read_offset=0 if inputs is None else len(inputs.prompt_tail_ids),
                     header=header,
                 )
                 self.decode_status[rid] = s
-            elif (s := self.decode_status.get(rid)) is not None:
-                s.decode_ids.extend(output_ids)
-            else:
+            elif (s := self.decode_status.get(rid)) is None:
                 logger.warning(
-                    f"Dropped the text of an output for {rid=}, which has no decode "
-                    "status. It may have been evicted: the detokenizer keeps at most "
-                    f"SGLANG_DETOKENIZER_MAX_STATES={DETOKENIZER_MAX_STATES} states. "
+                    f"No decode status for {rid=}: its row gets no text and no "
+                    "http_worker_ipc. It may have been evicted: the detokenizer "
+                    f"keeps at most SGLANG_DETOKENIZER_MAX_STATES="
+                    f"{DETOKENIZER_MAX_STATES} states. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                )
+            if s is not None and self.tokenizer is not None:
+                s.decode_ids.extend(
+                    self._clamp_decode_ids(recv_obj.output_ids[i], vocab_size)
                 )
             states.append(s)
         return states
@@ -370,16 +374,17 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 skip_list.append(True)
                 space_list.append(True)
                 continue
+            inputs = s.header.decode_inputs
             read_ids.append(
                 self.trim_matched_stop(
                     s.decode_ids[s.surr_offset :],
                     recv_obj.finished_reasons[i],
-                    s.header.no_stop_trim,
+                    inputs.no_stop_trim,
                 )
             )
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
-            skip_list.append(s.header.skip_special_tokens)
-            space_list.append(s.header.spaces_between_special_tokens)
+            skip_list.append(inputs.skip_special_tokens)
+            space_list.append(inputs.spaces_between_special_tokens)
 
         # Decode token ids to strings
         if not self.disable_tokenizer_batch_decode:
@@ -438,7 +443,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_str = self.trim_matched_stop(
                 s.get_decoded_text() + new_text,
                 recv_obj.finished_reasons[i],
-                s.header.no_stop_trim,
+                s.header.decode_inputs.no_stop_trim,
             )
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
@@ -467,13 +472,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         states = self._update_decode_status(recv_obj)
-        headers = [None if s is None else s.header for s in states]
+        http_worker_ipcs = [
+            None if s is None else s.header.http_worker_ipc for s in states
+        ]
+        if self.tokenizer is None:
+            # --skip-tokenizer-init: the tokenizer side takes the ids as they are.
+            for rid, finished_reason in zip(recv_obj.rids, recv_obj.finished_reasons):
+                if finished_reason is not None:
+                    self.decode_status.pop(rid, None)
+            recv_obj.http_worker_ipcs = http_worker_ipcs
+            return recv_obj
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
             decode_beam_search_output(
                 recv_obj,
-                headers,
+                [None if s is None else s.header.decode_inputs for s in states],
                 tokenizer=self.tokenizer,
                 disable_batch_decode=self.disable_tokenizer_batch_decode,
                 trim_matched_stop=self.trim_matched_stop,
@@ -488,9 +502,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
-            http_worker_ipcs=[
-                None if header is None else header.http_worker_ipc for header in headers
-            ],
+            http_worker_ipcs=http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
