@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import (
     DetokenizerManager,
@@ -18,6 +19,7 @@ from sglang.srt.managers.detokenizer_manager import (
 )
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
+    BeamSearchOutput,
     DecodeInputs,
     DetokenizeHeader,
     DetokenizeReleaseReq,
@@ -61,9 +63,15 @@ def _header(prompt_tail_ids=None, *, skip_special_tokens=True, ipc="worker-a"):
     )
 
 
-def _output(rows):
-    """rows: (rid, output_ids, header or None, finished)."""
+def _output(sent, rows):
+    """rows: (rid, output_ids, header or None, finished). sent: by rid, the
+    output ids the scheduler sent so far, which sets each row's
+    completion_tokens."""
     n = len(rows)
+    completion_tokens = []
+    for rid, ids, header, _ in rows:
+        sent[rid] = (0 if header is not None else sent.get(rid, 0)) + len(ids)
+        completion_tokens.append(sent[rid])
     headers = [header for _, _, header, _ in rows]
     return BatchTokenIDOutput(
         rids=[rid for rid, _, _, _ in rows],
@@ -73,7 +81,7 @@ def _output(rows):
         output_ids=[array("q", ids) for _, ids, _, _ in rows],
         detokenize_headers=headers if any(headers) else None,
         reasoning_tokens=[0] * n,
-        completion_tokens=[0] * n,
+        completion_tokens=completion_tokens,
         input_token_logprobs_val=None,
         input_token_logprobs_idx=None,
         output_token_logprobs_val=None,
@@ -113,6 +121,7 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         stored prompt tail with the stored flags, and their http_worker_ipcs
         come from the stored header."""
         detok = _detokenizer()
+        sent = {}
         header = _header([1, 2], skip_special_tokens=False)
 
         steps = [
@@ -123,7 +132,7 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         texts = []
         for ids, row_header, finished in steps:
             out = detok.handle_batch_token_id_out(
-                _output([("r", ids, row_header, finished)])
+                _output(sent, [("r", ids, row_header, finished)])
             )
             self.assertEqual(out.http_worker_ipcs, ["worker-a"])
             texts += out.output_strs
@@ -135,10 +144,13 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         """A request that reuses the rid of one that left state behind decodes
         only its own ids."""
         detok = _detokenizer()
-        detok.handle_batch_token_id_out(_output([("r", [3], _header([1]), False)]))
+        sent = {}
+        detok.handle_batch_token_id_out(
+            _output(sent, [("r", [3], _header([1]), False)])
+        )
 
         out = detok.handle_batch_token_id_out(
-            _output([("r", [7], _header([6], ipc="worker-b"), False)])
+            _output(sent, [("r", [7], _header([6], ipc="worker-b"), False)])
         )
 
         self.assertEqual(out.output_strs, ["7."])
@@ -149,9 +161,14 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         """After a release, a late row of the request decodes to no text and a
         warning, while the other rows of the batch decode as usual."""
         detok = _detokenizer()
+        sent = {}
         detok.handle_batch_token_id_out(
             _output(
-                [("gone", [3], _header([1]), False), ("kept", [4], _header([2]), False)]
+                sent,
+                [
+                    ("gone", [3], _header([1]), False),
+                    ("kept", [4], _header([2]), False),
+                ],
             )
         )
 
@@ -161,7 +178,7 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
             "sglang.srt.managers.detokenizer_manager", level="WARNING"
         ) as logs:
             out = detok.handle_batch_token_id_out(
-                _output([("gone", [5], None, True), ("kept", [6], None, False)])
+                _output(sent, [("gone", [5], None, True), ("kept", [6], None, False)])
             )
 
         self.assertIn("rid='gone'", logs.output[0])
@@ -173,19 +190,21 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         routes: rows carry no http_worker_ipcs, and each goes to the worker its
         request's first row named, until the request finishes or is released."""
         detok = _detokenizer(tokenizer=None)
+        sent = {}
         detok.init_request_dispatcher()
         detok.recv_from_scheduler = None
         detok.soft_watchdog = MagicMock()
         inbox = [
             _output(
+                sent,
                 [
                     ("a", [1], _header(ipc="w0"), False),
                     ("b", [2], _header(ipc="w1"), False),
-                ]
+                ],
             ),
-            _output([("b", [3], None, True), ("a", [4], None, False)]),
+            _output(sent, [("b", [3], None, True), ("a", [4], None, False)]),
             DetokenizeReleaseReq(rid="a"),
-            _output([("a", [5], None, False)]),
+            _output(sent, [("a", [5], None, False)]),
         ]
         received = []
         mapping = SimpleNamespace(
@@ -219,6 +238,36 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
             ],
         )
         self.assertEqual(len(detok.decode_status), 0)
+
+    def test_a_row_that_does_not_continue_the_received_ids_is_dropped(self):
+        """Each row's completion_tokens is the ids received before plus its own.
+        A row that breaks it gets no text (and raises in CI); a header restarts
+        the count, so a late row of the request a reused rid replaced fails; a
+        beam row, whose completion_tokens counts its sequences, is not checked."""
+        detok = _detokenizer()
+        sent = {}
+        detok.handle_batch_token_id_out(
+            _output(sent, [("r", [3], _header([1]), False)])
+        )
+        detok.handle_batch_token_id_out(
+            _output(sent, [("r", [4], _header([2]), False)])
+        )
+
+        late = _output({"r": 5}, [("r", [5], None, False)])
+        with self.assertLogs(
+            "sglang.srt.managers.detokenizer_manager", level="WARNING"
+        ) as logs:
+            out = detok.handle_batch_token_id_out(late)
+        self.assertIn("do not continue the 1 received", logs.output[0])
+        self.assertEqual(out.output_strs, [""])
+        with envs.SGLANG_IS_IN_CI.override(True), self.assertRaises(RuntimeError):
+            detok.handle_batch_token_id_out(late)
+
+        beam = _output(sent, [("r", [6], None, True)])
+        beam.completion_tokens = [9]
+        beam.beam_search_output = [BeamSearchOutput(sequences=[])]
+        out = detok.handle_batch_token_id_out(beam)
+        self.assertEqual(out.output_strs, ["6."])
 
 
 if __name__ == "__main__":

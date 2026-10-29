@@ -92,6 +92,9 @@ class DecodeStatus:
     surr_offset: int
     read_offset: int
     header: DetokenizeHeader
+    # Output tokens received so far; each row's completion_tokens is this
+    # plus the row's output ids.
+    num_output_ids: int = 0
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
     decoded_text_len: int = dataclasses.field(init=False)
@@ -322,12 +325,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _update_decode_status(
         self, recv_obj: BatchTokenIDOutput
     ) -> List[Optional[DecodeStatus]]:
-        """By row, the request's DecodeStatus with the row's output ids appended
-        when it decodes; None for a row whose request has no state."""
+        """By row, the request's DecodeStatus with the row's output ids appended;
+        None for a row whose request has no state or whose ids do not continue
+        the ones received."""
         vocab_size = self.vocab_size
         headers = recv_obj.detokenize_headers
+        beam_outputs = recv_obj.beam_search_output
         states = []
         for i, rid in enumerate(recv_obj.rids):
+            output_ids = recv_obj.output_ids[i]
             header = None if headers is None else headers[i]
             if header is not None:
                 # A request's first output; a stale state of a reused rid goes.
@@ -353,10 +359,26 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     f"{DETOKENIZER_MAX_STATES} states. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
-            if s is not None and self.tokenizer is not None:
-                s.decode_ids.extend(
-                    self._clamp_decode_ids(recv_obj.output_ids[i], vocab_size)
+            if (
+                s is not None
+                # A beam row's completion_tokens counts its returned sequences.
+                and (beam_outputs is None or beam_outputs[i] is None)
+                and s.num_output_ids + len(output_ids) != recv_obj.completion_tokens[i]
+            ):
+                msg = (
+                    f"Output ids of {rid=} do not continue the {s.num_output_ids} "
+                    f"received: {len(output_ids)} new for "
+                    f"{recv_obj.completion_tokens[i]} in all; its row gets no text "
+                    "and no http_worker_ipc."
                 )
+                if envs.SGLANG_IS_IN_CI.get():
+                    raise RuntimeError(msg)
+                logger.warning(msg)
+                s = None
+            if s is not None:
+                s.num_output_ids += len(output_ids)
+                if self.tokenizer is not None:
+                    s.decode_ids.extend(self._clamp_decode_ids(output_ids, vocab_size))
             states.append(s)
         return states
 
