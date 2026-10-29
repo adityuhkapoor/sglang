@@ -2616,7 +2616,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
                     # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) arrives unencoded.
+                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
