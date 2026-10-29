@@ -1643,19 +1643,33 @@ def build_flat_top_logprobs_arrays(
     return val_arr, idx_arr, null_prefix
 
 
+class DetokenizeHeader(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """A request's detokenization inputs. The scheduler sends it on the request's
+    first output only; the detokenizer keeps it for the request's lifetime and
+    decodes every later row from that row's output_ids."""
+
+    # The prompt tail decoded ahead of the output as context; the output text
+    # starts after it.
+    prompt_tail_ids: array
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    no_stop_trim: bool
+    http_worker_ipc: Optional[str]
+
+
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+    # http_worker_ipcs is set only with --skip-tokenizer-init, where no
+    # detokenizer keeps it; otherwise the DetokenizeHeader carries it.
+
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # For incremental decoding
-    decoded_texts: List[str]
-    decode_ids: List[array]  # List[array[int]]
-    read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
+    # The new output ids of each row, which the detokenizer decodes
     output_ids: Optional[List[array]]  # Optional[List[array[int]]]
-    # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    # By row, the request's DetokenizeHeader on its first output, else None;
+    # the whole field is None when no row carries one.
+    detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
 
     # Token counts
     reasoning_tokens: List[int]
@@ -1739,6 +1753,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
+class DetokenizeReleaseReq(BaseReq, kw_only=True):
+    """Drops the detokenizer's state of a request that ended outside the output
+    stream; sent on the output socket, so it follows the request's last row."""
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):

@@ -132,13 +132,7 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         spec_num_cap_tokens=[],
         spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
-        decoded_texts=["first", "second"],
-        decode_ids=[[1], [2]],
-        read_offsets=[0, 1],
         output_ids=[[1], [2]],
-        skip_special_tokens=[True, True],
-        spaces_between_special_tokens=[True, True],
-        no_stop_trim=[False, False],
         reasoning_tokens=[0, 0],
         completion_tokens=[1, 2],
         input_token_logprobs_val=[[], []],
@@ -174,14 +168,11 @@ def _make_batch_embedding_output() -> BatchEmbeddingOutput:
     )
 
 
-def _make_router() -> MultiDetokenizerRouter:
+def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
-    router._pick = lambda key: {
-        "worker-a": "detok-a",
-        "worker-b": "detok-b",
-    }[key]
+    router._pick = (targets_by_rid or {}).__getitem__
     return router
 
 
@@ -337,7 +328,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
     def test_router_groups_by_target_and_preserves_owner_ipcs(self):
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router({"rid-0": "detok-a", "rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -353,7 +344,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
     def test_router_keeps_first_target_order_and_does_not_cross_messages(self):
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-b", "worker-a"]
-        router = _make_router()
+        router = _make_router({"rid-0": "detok-b", "rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -369,8 +360,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
     def test_router_groups_token_output_without_speculative_decoding(self):
         output = _make_batch_token_id_output()
-        output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router({"token-rid-0": "detok-a", "token-rid-1": "detok-a"})
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -379,7 +369,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
+        self.assertEqual(sent[0][1].output_ids, [[1], [2]])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
     def test_embedding_split_preserves_per_request_fields(self):
@@ -411,7 +401,9 @@ class TestMultiTokenizerMixin(CustomTestCase):
     def test_router_sends_embedding_output_per_request(self):
         output = _make_batch_embedding_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
+        router = _make_router(
+            {"embedding-rid-0": "detok-a", "embedding-rid-1": "detok-a"}
+        )
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
 
@@ -422,9 +414,11 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
 
-    def test_router_keys_on_rid_without_tokenizer_worker_ipcs(self):
+    def test_router_keys_on_rid_not_tokenizer_worker_ipc(self):
+        """Only a request's first output carries its http_worker_ipc, so the
+        router keys every row on its rid, or a request's rows would split."""
         output = _make_batch_str_output()
-        output.http_worker_ipcs = [None, None]
+        output.http_worker_ipcs = ["worker-a", None]
         router = _make_router()
         router._pick = lambda key: f"detok-for-{key}"
         sent = []
@@ -437,7 +431,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(
             sent,
             [
-                ("detok-for-rid-0", ["rid-0"], [None]),
+                ("detok-for-rid-0", ["rid-0"], ["worker-a"]),
                 ("detok-for-rid-1", ["rid-1"], [None]),
             ],
         )

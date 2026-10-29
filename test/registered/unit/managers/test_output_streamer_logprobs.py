@@ -1,7 +1,9 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -30,9 +32,9 @@ class _FakeReq:
         self.output_ids_through_stop = []
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
+        self.detokenize_header_sent = False
         self.origin_input_ids = []
+        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
@@ -63,8 +65,7 @@ class _FakeReq:
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
+    take_detokenize_header_due = Req.take_detokenize_header_due
 
 
 def _make_accumulator(
@@ -81,6 +82,7 @@ def _make_accumulator(
         default_force_stream_interval=1,
         build_request_header=lambda req: None,
         rust_server_mode=rust_server_mode,
+        skip_tokenizer_init=False,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )

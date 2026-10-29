@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    DetokenizeReleaseReq,
     RequestOutputHeader,
     msgpack_decode,
     msgpack_encode,
@@ -74,9 +75,9 @@ class _FakeReq:
         self.output_ids_through_stop = output_ids
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
+        self.detokenize_header_sent = False
         self.origin_input_ids = []
+        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.cached_tokens_device = 0
@@ -103,8 +104,7 @@ class _FakeReq:
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
+    take_detokenize_header_due = Req.take_detokenize_header_due
 
     def check_match_stop_str_prefix(self):
         return False
@@ -130,6 +130,7 @@ def _accumulator(
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
+        skip_tokenizer_init=False,
     )
 
 
@@ -317,6 +318,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -349,6 +351,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         quiet = _FakeReq("quiet", [10, 11])
@@ -386,6 +389,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         terminal = _FakeReq("terminal", [20], finished=True)
@@ -426,6 +430,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         first = _FakeReq("duplicate", [10], finished=True)
@@ -450,6 +455,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -475,6 +481,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -496,6 +503,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )
@@ -561,6 +569,7 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
             rust_server=rust_server,
         )
@@ -600,6 +609,7 @@ def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True)
         is_generation=is_generation,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         disaggregation_mode=DisaggregationMode.NULL,
+        skip_tokenizer_init=False,
         enable_hicache_storage=enable_hicache_storage,
     )
 
@@ -897,6 +907,76 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             received[i][0].extend(masks)
                             received[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+
+
+class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _req(self):
+        sampling_params = SamplingParams(skip_special_tokens=False)
+        sampling_params.normalize(None)
+        req = Req("r", "", array("q", range(7)), sampling_params, stream=True)
+        req.http_worker_ipc = "worker-a"
+        return req
+
+    def test_header_goes_out_on_first_output_only(self):
+        """The detokenizer keeps the header for the request's lifetime, and
+        retraction keeps the output ids it decodes, so no later row resends it."""
+        outputs = []
+        streamer = _streamer(outputs)
+        req = self._req()
+
+        def output():
+            req.output_ids.append(7)
+            streamer.stream_output([req], False)
+            [payload] = outputs
+            outputs.clear()
+            return payload.detokenize_headers
+
+        [first] = output()
+        self.assertEqual(list(first.prompt_tail_ids), [2, 3, 4, 5, 6])
+        self.assertFalse(first.skip_special_tokens)
+        self.assertEqual(first.http_worker_ipc, "worker-a")
+        self.assertIsNone(output())
+        req.reset_for_retract()
+        self.assertIsNone(output())
+
+    def test_release_follows_a_sent_header_only(self):
+        outputs = []
+        streamer = _streamer(outputs)
+        req = self._req()
+
+        streamer.release_detokenize_state(req)
+        self.assertEqual(outputs, [])
+
+        req.output_ids.append(7)
+        streamer.stream_output([req], False)
+        streamer.release_detokenize_state(req)
+        self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
+
+    def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
+        """Without a detokenizer the tokenizer-side router routes each row by
+        its http_worker_ipc, and nothing would keep a header."""
+        outputs = []
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            server_args=SimpleNamespace(enable_lmcache=False),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=True,
+            enable_hicache_storage=lambda: False,
+        )
+        req = self._req()
+        for _ in range(2):
+            req.output_ids.append(7)
+            streamer.stream_output([req], False)
+            self.assertEqual(outputs[-1].http_worker_ipcs, ["worker-a"])
+            self.assertIsNone(outputs[-1].detokenize_headers)
+        streamer.release_detokenize_state(req)
+        self.assertEqual(len(outputs), 2)
 
 
 if __name__ == "__main__":

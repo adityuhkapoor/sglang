@@ -501,7 +501,9 @@ class TestRustServerExtension(CustomTestCase):
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        scheduler = SimpleNamespace(
+            rust_server=server, ipc_channels=Mock(), output_streamer=Mock()
+        )
         Scheduler.send_abort_output(scheduler, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
