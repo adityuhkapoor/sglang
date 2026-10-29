@@ -1661,7 +1661,8 @@ class DetokenizeHeader(
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # http_worker_ipcs is set only with --skip-tokenizer-init, where no
-    # detokenizer keeps it; otherwise the DetokenizeHeader carries it.
+    # detokenizer keeps it; otherwise the DetokenizeHeader and
+    # finished_http_worker_ipcs carry it.
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1670,6 +1671,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # By row, the request's DetokenizeHeader on its first output, else None;
     # the whole field is None when no row carries one.
     detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
+    # By row, a finished row's http_worker_ipc, else None; the whole field is None
+    # when no row finished. A finished row routes by it, even with no stored state.
+    finished_http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     # Token counts
     reasoning_tokens: List[int]

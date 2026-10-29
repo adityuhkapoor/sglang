@@ -3,6 +3,7 @@ on its first output and decodes every later row from that row's output_ids."""
 
 import unittest
 from array import array
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -10,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs
+from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import (
     DetokenizerManager,
     LimitedCapacityDict,
@@ -52,10 +54,10 @@ def _header(prompt_tail_ids, *, skip_special_tokens=True, ipc="worker-a"):
     )
 
 
-def _output(sent, rows):
+def _output(sent, rows, *, ipc="worker-a"):
     """rows: (rid, output_ids, header or None, finished). sent: by rid, the
     output ids the scheduler sent so far, which sets each row's
-    completion_tokens."""
+    completion_tokens. A finished row carries ipc as its own route."""
     n = len(rows)
     completion_tokens = []
     for rid, ids, header, _ in rows:
@@ -69,6 +71,11 @@ def _output(sent, rows):
         ],
         output_ids=[array("q", ids) for _, ids, _, _ in rows],
         detokenize_headers=headers if any(headers) else None,
+        finished_http_worker_ipcs=(
+            [ipc if finished else None for *_, finished in rows]
+            if any(finished for *_, finished in rows)
+            else None
+        ),
         reasoning_tokens=[0] * n,
         completion_tokens=completion_tokens,
         input_token_logprobs_val=None,
@@ -93,15 +100,57 @@ def _output(sent, rows):
     )
 
 
-def _detokenizer():
+def _detokenizer(capacity=16):
     detok = DetokenizerManager.__new__(DetokenizerManager)
     detok.tokenizer = _Tokenizer()
     detok.vocab_size = None
-    detok.decode_status = LimitedCapacityDict(capacity=16)
+    detok.decode_status = LimitedCapacityDict(capacity=capacity)
     detok.disable_tokenizer_batch_decode = False
     detok.is_tool_call_parser_gpt_oss = False
     detok.tool_close_token_ids = frozenset()
     return detok
+
+
+class _Drained(Exception):
+    pass
+
+
+def _deliver(detok, outputs):
+    """Run the multi-tokenizer event loop over outputs; return each row that
+    reaches a tokenizer worker as (worker, rid, text, finished)."""
+    queue = list(outputs)
+    received = []
+
+    def recv(_socket):
+        if not queue:
+            raise _Drained
+        return queue.pop(0)
+
+    def send(worker, out):
+        received.extend(
+            (worker, rid, text, reason is not None)
+            for rid, text, reason in zip(
+                out.rids, out.output_strs, out.finished_reasons
+            )
+        )
+
+    detok.recv_from_scheduler = None
+    detok.soft_watchdog = mock.MagicMock()
+    detok.init_request_dispatcher()
+    with (
+        mock.patch.object(multi_tokenizer_mixin, "sock_recv", side_effect=recv),
+        mock.patch.object(
+            multi_tokenizer_mixin,
+            "get_zmq_socket",
+            side_effect=lambda _context, _type, ipc, _bind: ipc,
+        ),
+        mock.patch.object(multi_tokenizer_mixin, "sock_send", side_effect=send),
+    ):
+        try:
+            detok.multi_http_worker_event_loop()
+        except _Drained:
+            pass
+    return received
 
 
 class TestDetokenizerDecodeStatus(CustomTestCase):
@@ -147,8 +196,9 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
         self.assertEqual(list(detok.decode_status["r"].decode_ids), [6, 7])
 
     def test_a_row_without_state_drops_only_its_text(self):
-        """After a release, a late row of the request decodes to no text and a
-        warning, while the other rows of the batch decode as usual."""
+        """After a release, a late row of the request (an in-flight batch's row
+        under overlap) decodes to no text and a warning, while the other rows of
+        the batch decode as usual."""
         detok = _detokenizer()
         sent = {}
         detok.handle_batch_token_id_out(
@@ -167,12 +217,61 @@ class TestDetokenizerDecodeStatus(CustomTestCase):
             "sglang.srt.managers.detokenizer_manager", level="WARNING"
         ) as logs:
             out = detok.handle_batch_token_id_out(
-                _output(sent, [("gone", [5], None, True), ("kept", [6], None, False)])
+                _output(sent, [("gone", [], None, False), ("kept", [6], None, False)])
             )
 
         self.assertIn("rid='gone'", logs.output[0])
         self.assertEqual(out.output_strs, ["", "6."])
         self.assertEqual(out.http_worker_ipcs, [None, "worker-a"])
+
+    def test_a_finished_row_without_state_reaches_its_tokenizer_worker(self):
+        """A finished row routes by the route it carries, so its client gets the
+        finish after its state was evicted."""
+        detok = _detokenizer(capacity=1)
+        sent = {}
+        outputs = [
+            _output(sent, [("a", [3], _header([1]), False)]),
+            _output(sent, [("b", [4], _header([2], ipc="worker-b"), False)]),
+            _output(sent, [("a", [5], None, True)]),
+        ]
+
+        with self.assertLogs(
+            "sglang.srt.managers.detokenizer_manager", level="WARNING"
+        ):
+            delivered = _deliver(detok, outputs)
+
+        self.assertEqual(
+            delivered,
+            [
+                ("worker-a", "a", "3.", False),
+                ("worker-b", "b", "4.", False),
+                ("worker-a", "a", "", True),
+            ],
+        )
+
+    def test_one_rid_on_two_tokenizer_workers_finishes_on_both(self):
+        """Two tokenizer workers may have the same rid in flight: the second
+        header replaces the first request's state, and the first request's
+        finish frees it. Each finished row still reaches its own worker."""
+        detok = _detokenizer()
+        sent = {}
+        outputs = [
+            _output(sent, [("r", [3], _header([1]), False)]),
+            _output(sent, [("r", [4], _header([2], ipc="worker-b"), False)]),
+            _output(sent, [("r", [5], None, True)], ipc="worker-a"),
+            _output(sent, [("r", [6], None, False)]),
+            _output(sent, [("r", [7], None, True)], ipc="worker-b"),
+        ]
+
+        with self.assertLogs(
+            "sglang.srt.managers.detokenizer_manager", level="WARNING"
+        ):
+            delivered = _deliver(detok, outputs)
+
+        self.assertEqual(
+            [(worker, rid) for worker, rid, _, finished in delivered if finished],
+            [("worker-a", "r"), ("worker-b", "r")],
+        )
 
     def test_a_row_that_does_not_continue_the_received_ids_raises_an_alarm(self):
         """Each row's completion_tokens is the ids received before plus its own.

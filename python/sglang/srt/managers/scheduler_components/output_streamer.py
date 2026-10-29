@@ -393,6 +393,8 @@ class _GenerationStreamAccumulator:
     output_ids: list = field(default_factory=list)
     detokenize_headers: list = field(default_factory=list)
     has_detokenize_header: bool = False
+    # By row index, a finished row's http_worker_ipc; see BatchTokenIDOutput.
+    finished_http_worker_ipcs: dict = field(default_factory=dict)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     request_stats: list = field(default_factory=list)
@@ -583,6 +585,8 @@ class _GenerationStreamAccumulator:
                 latency = _scheduler_decode_latency(req.time_stats)
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
+            if not (self.rust_server_mode or self.skip_tokenizer_init):
+                self.finished_http_worker_ipcs[len(self.rids) - 1] = req.http_worker_ipc
         else:
             self.weight_versions.append(None)
 
@@ -765,6 +769,11 @@ class _GenerationStreamAccumulator:
             output_ids=self.output_ids,
             detokenize_headers=(
                 self.detokenize_headers if self.has_detokenize_header else None
+            ),
+            finished_http_worker_ipcs=(
+                [self.finished_http_worker_ipcs.get(i) for i in range(len(self.rids))]
+                if self.finished_http_worker_ipcs
+                else None
             ),
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,

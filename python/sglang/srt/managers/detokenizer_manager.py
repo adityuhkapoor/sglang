@@ -484,6 +484,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    @staticmethod
+    def _http_worker_ipcs(
+        recv_obj: BatchTokenIDOutput, headers: List[Optional[DetokenizeHeader]]
+    ) -> List[Optional[str]]:
+        ipcs = [
+            None if header is None else header.http_worker_ipc for header in headers
+        ]
+        finished_ipcs = recv_obj.finished_http_worker_ipcs
+        if finished_ipcs is not None:
+            # A finished row's own route wins: the stored header may be missing
+            # (evicted) or another request's (one rid in flight on two workers).
+            for i, ipc in enumerate(finished_ipcs):
+                if ipc is not None:
+                    ipcs[i] = ipc
+        return ipcs
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         states = self._update_decode_status(recv_obj)
         headers = [None if s is None else s.header for s in states]
@@ -507,9 +523,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
-            http_worker_ipcs=[
-                None if header is None else header.http_worker_ipc for header in headers
-            ],
+            http_worker_ipcs=self._http_worker_ipcs(recv_obj, headers),
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,

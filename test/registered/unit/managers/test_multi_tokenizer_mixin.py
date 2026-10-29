@@ -372,6 +372,23 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(sent[0][1].output_ids, [[1], [2]])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
+    def test_router_split_keeps_each_finished_rows_route(self):
+        """The detokenizer may hold no state for a finished row, so the row's
+        own route must survive the split to its detokenizer."""
+        output = _make_batch_token_id_output()
+        output.finished_reasons = [None, {"type": "length"}]
+        output.finished_http_worker_ipcs = [None, "worker-b"]
+        router = _make_router({"token-rid-0": "detok-a", "token-rid-1": "detok-b"})
+        sent = []
+        router._send = lambda target, obj: sent.append((target, obj))
+
+        router._send_batch(output)
+
+        self.assertEqual(
+            [(target, obj.finished_http_worker_ipcs) for target, obj in sent],
+            [("detok-a", [None]), ("detok-b", ["worker-b"])],
+        )
+
     def test_embedding_split_preserves_per_request_fields(self):
         output = _make_batch_embedding_output()
         output.pooled_hidden_states = [[1.0], [2.0]]
@@ -415,8 +432,8 @@ class TestMultiTokenizerMixin(CustomTestCase):
         )
 
     def test_router_keys_on_rid_not_tokenizer_worker_ipc(self):
-        """Only a request's first output carries its http_worker_ipc, so the
-        router keys every row on its rid, or a request's rows would split."""
+        """Only a request's first and finished outputs carry its http_worker_ipc,
+        so the router keys every row on its rid, or a request's rows would split."""
         output = _make_batch_str_output()
         output.http_worker_ipcs = ["worker-a", None]
         router = _make_router()

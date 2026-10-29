@@ -923,11 +923,11 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
     def setUp(self):
         _enter_streamer_scope(self)
 
-    def _req(self):
+    def _req(self, rid="r", ipc="worker-a"):
         sampling_params = SamplingParams(skip_special_tokens=False)
         sampling_params.normalize(None)
-        req = Req("r", "", array("q", range(7)), sampling_params, stream=True)
-        req.http_worker_ipc = "worker-a"
+        req = Req(rid, "", array("q", range(7)), sampling_params, stream=True)
+        req.http_worker_ipc = ipc
         return req
 
     def test_header_goes_out_on_first_output_only(self):
@@ -964,6 +964,23 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         streamer.stream_output([req], False)
         streamer.release_detokenize_state(req)
         self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
+
+    def test_finished_rows_carry_their_route(self):
+        """The detokenizer may hold no state for a finished row, so each finished
+        row carries its own route; a batch with no finished row sends none."""
+        outputs = []
+        streamer = _streamer(outputs)
+        running, done = self._req("running"), self._req("done", ipc="worker-b")
+
+        for step in range(2):
+            for req in (running, done):
+                req.output_ids.append(7)
+            if step == 1:
+                done.finished_reason = FINISH_LENGTH(length=2)
+            streamer.stream_output([running, done], False)
+
+        self.assertIsNone(outputs[0].finished_http_worker_ipcs)
+        self.assertEqual(outputs[1].finished_http_worker_ipcs, [None, "worker-b"])
 
     def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
         """Without a detokenizer the tokenizer-side router routes each row by
